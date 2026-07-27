@@ -3,7 +3,7 @@ import threading
 import queue
 import tkinter as tk
 from tkinter import ttk
-from meshcore import MeshCore
+from meshcore import MeshCore, EventType
 
 # This program uses at least 2 threads at any given time, this is so that non-blocking
 # communication to the radio can occur while Tkinter is also able to draw the display
@@ -19,8 +19,9 @@ incoming_q = queue.Queue()   # Radio --> GUI
 # The Background Thread - all of this is for handling communication with the radio.
 # ===============================================================================================================
 class RadioWorker:
-    def __init__(self, incoming_q: queue.Queue):
+    def __init__(self, incoming_q: queue.Queue, port: str = "/dev/ttyUSB0"):
         self.incoming_q = incoming_q
+        self.port = port
         self.loop: asyncio.AbstractEventLoop | None = None
         self.mc = None  # will hold the meshcore Client instance
 
@@ -33,24 +34,43 @@ class RadioWorker:
         """Runs entirely in the background thread"""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._async_main())
+        self.loop.run_until_complete(self._async_main(self.port))
         self.loop.run_forever()  # Keeps the thread's loop alive so that later commands
                                    # from the GUI thread have somewhere to go.
 
-    async def _async_main(self):
+    async def _async_main(self, port: str = "/dev/ttyUSB0"):
         """
         RADIO CONNECT + LISTEN
-        This is where meshcore_py setup happens: open the serial connection,
-        subscribe to incoming packet events, etc.
+        Opens the serial connection, subscribes to incoming message events,
+        and starts auto-fetching so the library pushes new messages to us
+        instead of us having to poll for them.
         """
-        # self.mc = await MeshCore.create_serial("/dev/ttyUSB0")
-        #
-        # def on_message(packet):
-        #     self.incoming_q.put(packet)
-        #
-        # self.mc.subscribe(on_message)   # exact API depends on meshcore_py
+        try:
+            self.mc = await MeshCore.create_serial(port, 115200)
+        except Exception as exc:
+            # Connection failed (wrong port, device unplugged, permissions, etc.)
+            # Report it through the SAME mailbox the GUI already polls, so the
+            # error shows up in the Text widget instead of crashing silently
+            # in the background thread.
+            self.incoming_q.put(f"[ERROR] could not open {port}: {exc}")
+            return
 
-        pass  # replace with real connect/subscribe logic.
+        self.incoming_q.put(f"[connected on {port}]")
+
+        # Handler runs inside the asyncio thread -- its ONLY job is to hand
+        # the event payload to the queue. Never touch Tkinter widgets here.
+        async def on_message(event):
+            data = event.payload
+            text = data.get("text", "")
+            sender = data.get("pubkey_prefix", "unknown")
+            self.incoming_q.put(f"{sender}: {text}")
+
+        self.mc.subscribe(EventType.CONTACT_MSG_RECV, on_message)
+
+        # Without this, incoming messages sit on the device until something
+        # explicitly calls get_msg() -- auto-fetching makes them arrive as
+        # CONTACT_MSG_RECV events on their own.
+        await self.mc.start_auto_message_fetching()
 
     async def send_command(self, text: str):
         """
@@ -58,8 +78,22 @@ class RadioWorker:
         A coroutine that actually talks to the radio. This only ever gets
         *called* via run_coroutine_threadsafe from the GUI thread --
         never called directly from Tkinter code.
+
+        NOTE: send_msg() needs a destination contact/key -- sending requires
+        picking a contact first. This stub just demonstrates the call shape;
+        wire up contact selection (e.g. a dropdown fed by get_contacts())
+        before this will actually work.
         """
-        # await self.mc.send_message(text)
+        if self.mc is None:
+            self.incoming_q.put("[ERROR] not connected, cannot send")
+            return
+
+        # Example once you have a destination contact/key:
+        # result = await self.mc.commands.send_msg(dst, text)
+        # if result.type == EventType.ERROR:
+        #     self.incoming_q.put(f"[ERROR] send failed: {result.payload}")
+        # else:
+        #     self.incoming_q.put(f"[sent] {text}")
         print(f"[radio thread] would send: {text}")
 
 
